@@ -1,0 +1,207 @@
+name: dev-CD-ohc-be-care
+
+on:
+  push:
+    tags:
+      - dev-*
+
+env:
+  ECR_REPO_URL: ${{ secrets.DEV_ECR_REPO }}
+  ECR_REPOSITORY: ${{ github.event.repository.name }}
+  NAMESPACE: eka-dev
+
+jobs:
+  build-push:
+    permissions:
+      id-token: write
+      contents: read
+    runs-on: dev-spot-ec2-runner-arm64
+    outputs:
+      VERSION: ${{ steps.get_version.outputs.VERSION }}
+      PREV_TAG: ${{ steps.get_version.outputs.PREV_TAG }}
+      COMPARE_URL: ${{ steps.get_version.outputs.COMPARE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so git tag -l sees all tags
+
+      - name: Get the version
+        id: get_version
+        run: |
+          IMAGE_TAG=$(echo $GITHUB_REF | cut -d / -f 3)
+          echo "VERSION=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+          # Determine tag prefix (e.g. "dev-") and find previous tag
+          TAG_PREFIX=$(echo "$IMAGE_TAG" | sed 's/[0-9].*$//')
+          PREV_TAG=$(git tag -l "${TAG_PREFIX}*" --sort=-version:refname 2>/dev/null \
+            | grep -v "^${IMAGE_TAG}$" | head -1 || true)
+
+          if [ -n "$PREV_TAG" ]; then
+            COMPARE_URL="https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${IMAGE_TAG}"
+          else
+            PREV_TAG="—"
+            COMPARE_URL="https://github.com/${{ github.repository }}/commits/${IMAGE_TAG}"
+          fi
+          echo "PREV_TAG=$PREV_TAG"     >> $GITHUB_OUTPUT
+          echo "COMPARE_URL=$COMPARE_URL" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: IAM role for GitHub runner
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: arn:aws:iam::607765814920:role/github-runner-role
+          role-session-name: runner-role
+          aws-region: ${{ secrets.DEV_AWS_Region }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR repository if not exists
+        run: |
+          set +e
+          output=$(aws ecr describe-repositories \
+            --region ${{ secrets.DEV_AWS_Region }} \
+            --repository-names $ECR_REPOSITORY 2>&1)
+          exit_code=$?
+          set -e
+          if [ $exit_code -ne 0 ]; then
+            if echo "$output" | grep -q RepositoryNotFoundException; then
+              echo "Creating ECR repository: $ECR_REPOSITORY"
+              aws ecr create-repository \
+                --region ${{ secrets.DEV_AWS_Region }} \
+                --repository-name $ECR_REPOSITORY \
+                --image-scanning-configuration scanOnPush=true
+              aws ecr put-lifecycle-policy \
+                --region ${{ secrets.DEV_AWS_Region }} \
+                --repository-name $ECR_REPOSITORY \
+                --lifecycle-policy-text '{
+                  "rules": [
+                    {"rulePriority":1,"description":"remove untagged images","selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":1},"action":{"type":"expire"}},
+                    {"rulePriority":2,"description":"keep last 5 tagged images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}
+                  ]
+                }'
+              echo "ECR repository created."
+            else
+              echo "$output" >&2
+              exit 1
+            fi
+          else
+            echo "ECR repository already exists, skipping."
+          fi
+
+      - name: Set up Docker Buildx
+        run: |
+          docker buildx use mybuilder 2>/dev/null || \
+            docker buildx create --name mybuilder --driver docker-container --bootstrap --use
+
+      - name: Build Docker image
+        env:
+          IMAGE_TAG: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          docker buildx build \
+            --progress=plain \
+            --cache-from=type=registry,ref=${ECR_REPO_URL}/${ECR_REPOSITORY}:buildcache-ohc-be-care \
+            --cache-to=type=registry,ref=${ECR_REPO_URL}/${ECR_REPOSITORY}:buildcache-ohc-be-care,mode=max \
+            -t ${ECR_REPO_URL}/${ECR_REPOSITORY}:${IMAGE_TAG} \
+            -t ${ECR_REPO_URL}/${ECR_REPOSITORY}:latest \
+            -f docker/prod.Dockerfile \
+            --load .
+
+      - name: Push image to Amazon ECR
+        env:
+          IMAGE_TAG: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          docker push $ECR_REPO_URL/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REPO_URL/$ECR_REPOSITORY:latest
+
+      - name: Build summary
+        env:
+          IMAGE_TAG: ${{ steps.get_version.outputs.VERSION }}
+          PREV_TAG: ${{ steps.get_version.outputs.PREV_TAG }}
+          COMPARE_URL: ${{ steps.get_version.outputs.COMPARE_URL }}
+        run: |
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          COMMIT_URL="https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD)"
+
+          {
+            echo "## 🏗️ Build — \`${IMAGE_TAG}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **App** | ohc-be-care |"
+            echo "| **Version** | \`${IMAGE_TAG}\` |"
+            echo "| **Previous** | \`${PREV_TAG}\` |"
+            echo "| **Image** | \`${ECR_REPO_URL}/${ECR_REPOSITORY}:${IMAGE_TAG}\` |"
+            echo "| **Commit** | [\`${COMMIT_SHA}\`](${COMMIT_URL}) ${COMMIT_MSG} |"
+            echo "| **Author** | ${COMMIT_AUTHOR} |"
+            echo "| **Triggered by** | @${{ github.actor }} |"
+            echo "| **Dockerfile** | \`docker/prod.Dockerfile\` |"
+            echo ""
+
+            if [ "$PREV_TAG" != "—" ]; then
+              echo "### 📋 Changes since \`${PREV_TAG}\`"
+              echo ""
+              while IFS= read -r line; do
+                sha=$(echo "$line" | awk '{print $1}')
+                msg=$(echo "$line" | cut -d' ' -f2-)
+                echo "- [\`${sha}\`](https://github.com/${{ github.repository }}/commit/${sha}) ${msg}"
+              done < <(git log --oneline "${PREV_TAG}..HEAD" 2>/dev/null | head -20)
+              echo ""
+              echo "[🔍 Full diff: \`${PREV_TAG}\` → \`${IMAGE_TAG}\`](${COMPARE_URL})"
+            else
+              echo "### 📋 Initial release"
+              echo ""
+              echo "- [\`${COMMIT_SHA}\`](${COMMIT_URL}) ${COMMIT_MSG}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: build-push
+    runs-on: dev-spot-ec2-runner-arm64
+
+    steps:
+      - name: Repository dispatch to dev-argocd
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.argocd_github_token }}
+          repository: eka-care/dev-argocd
+          event-type: deploy-service
+          client-payload: >-
+            {"values_file_path": "ohc-be-care/values/dev-values.yaml", "image_tag": "${{ needs.build-push.outputs.VERSION }}", "ecr_repo_url": "${{ secrets.DEV_ECR_REPO }}", "ecr_repository": "${{ env.ECR_REPOSITORY }}", "namespace": "eka-dev", "argocd_app_name": "ohc-be-care", "deployment_name": "ohc-be-care"}
+
+      - name: Deployment summary
+        if: always()
+        env:
+          IMAGE_TAG: ${{ needs.build-push.outputs.VERSION }}
+          PREV_TAG: ${{ needs.build-push.outputs.PREV_TAG }}
+          COMPARE_URL: ${{ needs.build-push.outputs.COMPARE_URL }}
+        run: |
+          case "${{ job.status }}" in
+            success)   STATUS="✅ Dispatched to ArgoCD" ;;
+            failure)   STATUS="❌ Failed" ;;
+            cancelled) STATUS="⚠️ Cancelled" ;;
+            *)         STATUS="${{ job.status }}" ;;
+          esac
+
+          {
+            echo "## 🚀 Deployment — ohc-be-care"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Status** | ${STATUS} |"
+            echo "| **Version** | \`${IMAGE_TAG}\` |"
+            echo "| **Previous** | \`${PREV_TAG}\` |"
+            echo "| **Environment** | dev (staging) |"
+            echo "| **Namespace** | \`eka-dev\` |"
+            echo "| **Cluster** | \`dev-eks-1-29\` |"
+            echo ""
+            echo "[🔗 View in ArgoCD →](https://argocd.dev.eka.care/applications/ohc-be-care) &nbsp;&nbsp; [🔍 Compare changes →](${COMPARE_URL})"
+          } >> "$GITHUB_STEP_SUMMARY"
