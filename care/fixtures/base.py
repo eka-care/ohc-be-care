@@ -3,10 +3,12 @@ import re
 import secrets
 import string
 from collections import UserDict
+from datetime import timedelta
 from pathlib import Path
 from secrets import choice
 
 from django.urls import reverse
+from django.utils import timezone
 from faker import Faker
 from rest_framework import status as http_status
 
@@ -644,6 +646,281 @@ class CareFixtureBase:
             "status": "active",
             "default_format": "html",
             "facility": facility,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    # ------------------------------------------------------------------
+    # Clinical chart (Condition / Allergy / Observation via reports)
+    # ------------------------------------------------------------------
+    def create_symptom(self, patient_id, encounter_id, code, **kwargs):
+        url = reverse("symptom-list", kwargs={"patient_external_id": patient_id})
+        data = {
+            "encounter": encounter_id,
+            "category": "problem_list_item",
+            "clinical_status": "active",
+            "verification_status": "confirmed",
+            "severity": choice(["mild", "moderate", "severe"]),
+            "code": code,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_diagnosis(self, patient_id, encounter_id, code, **kwargs):
+        url = reverse("diagnosis-list", kwargs={"patient_external_id": patient_id})
+        data = {
+            "encounter": encounter_id,
+            "category": "encounter_diagnosis",
+            "clinical_status": "active",
+            "verification_status": "confirmed",
+            "severity": choice(["mild", "moderate", "severe"]),
+            "code": code,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_allergy_intolerance(self, patient_id, encounter_id, code, **kwargs):
+        url = reverse(
+            "allergy-intolerance-list", kwargs={"patient_external_id": patient_id}
+        )
+        data = {
+            "encounter": encounter_id,
+            "category": choice(["food", "medication", "environment"]),
+            "clinical_status": "active",
+            "verification_status": "confirmed",
+            "criticality": choice(["low", "high"]),
+            "code": code,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    # ------------------------------------------------------------------
+    # Medication
+    # ------------------------------------------------------------------
+    def create_medication_request(self, patient_id, encounter_id, medication, **kwargs):
+        url = reverse(
+            "medication-request-list", kwargs={"patient_external_id": patient_id}
+        )
+        data = {
+            "status": "active",
+            "intent": "order",
+            "category": "inpatient",
+            "priority": "routine",
+            "do_not_perform": False,
+            "medication": medication,
+            "dosage_instruction": [],
+            "authored_on": kwargs.pop("authored_on", timezone.now().isoformat()),
+            "encounter": encounter_id,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_medication_dispense(
+        self, encounter_id, location_id, item_id, quantity=1, **kwargs
+    ):
+        data = {
+            "status": "completed",
+            "category": "inpatient",
+            "encounter": encounter_id,
+            "location": location_id,
+            "item": item_id,
+            "quantity": quantity,
+            **kwargs,
+        }
+        return self.post(reverse("medication-dispense-list"), data)
+
+    def create_medication_request_prescription(
+        self, patient_id, encounter_id, prescribed_by, **kwargs
+    ):
+        url = reverse(
+            "medication-request-prescription-list",
+            kwargs={"patient_external_id": patient_id},
+        )
+        data = {
+            "status": "active",
+            "encounter": encounter_id,
+            "prescribed_by": prescribed_by,
+            "name": kwargs.pop("name", "Prescription"),
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    # ------------------------------------------------------------------
+    # Lab / Diagnostics (ServiceRequest -> Specimen -> DiagnosticReport)
+    # ------------------------------------------------------------------
+    def create_service_request(
+        self, facility_id, encounter_id, requester_id, code, locations=None, **kwargs
+    ):
+        url = reverse(
+            "service_request-list", kwargs={"facility_external_id": facility_id}
+        )
+        data = {
+            "title": code.get("display", "Lab Test"),
+            "status": "active",
+            "intent": "order",
+            "priority": "routine",
+            "category": "laboratory",
+            "code": code,
+            "encounter": encounter_id,
+            "requester": requester_id,
+            "locations": locations or [],
+            "healthcare_service": None,
+            "do_not_perform": False,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_specimen(self, facility_id, service_request_id, specimen_type, **kwargs):
+        url = reverse(
+            "service_request-create-specimen",
+            kwargs={
+                "facility_external_id": facility_id,
+                "external_id": service_request_id,
+            },
+        )
+        data = {
+            "status": "available",
+            "specimen_type": specimen_type,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_diagnostic_report(
+        self, patient_id, service_request_id, category, **kwargs
+    ):
+        url = reverse(
+            "diagnostic_report-list", kwargs={"patient_external_id": patient_id}
+        )
+        data = {
+            "status": "preliminary",
+            "category": category,
+            "service_request": service_request_id,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def add_observations_to_report(self, patient_id, report_id, observations):
+        url = reverse(
+            "diagnostic_report-upsert-observations",
+            kwargs={"patient_external_id": patient_id, "external_id": report_id},
+        )
+        for entry in observations:
+            entry.get("observation", {}).setdefault("status", "final")
+        return self.post(url, {"observations": observations})
+
+    # ------------------------------------------------------------------
+    # Billing (Account -> ChargeItem -> Invoice -> PaymentReconciliation)
+    # ------------------------------------------------------------------
+    def create_account(self, facility_id, patient_id, **kwargs):
+        url = reverse("account-list", kwargs={"facility_external_id": facility_id})
+        now = timezone.now()
+        data = {
+            "status": "active",
+            "billing_status": "open",
+            "name": kwargs.pop("name", "Patient Billing Account"),
+            "patient": patient_id,
+            "service_period": {
+                "start": now.isoformat(),
+                "end": (now + timedelta(days=365)).isoformat(),
+            },
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_charge_item(
+        self, facility_id, encounter_id, account_id, unit_price_components, **kwargs
+    ):
+        url = reverse("charge_item-list", kwargs={"facility_external_id": facility_id})
+        data = {
+            "title": kwargs.pop("title", "Charge Item"),
+            "status": "billable",
+            "quantity": 1,
+            "unit_price_components": unit_price_components,
+            "encounter": encounter_id,
+            "account": account_id,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_invoice(self, facility_id, account_id, charge_items, **kwargs):
+        url = reverse("invoice-list", kwargs={"facility_external_id": facility_id})
+        data = {
+            "status": "issued",
+            "account": account_id,
+            "charge_items": charge_items,
+            "title": kwargs.pop("title", "Invoice"),
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_payment_reconciliation(
+        self, facility_id, account_id, target_invoice, amount, **kwargs
+    ):
+        url = reverse(
+            "payment_reconciliation-list",
+            kwargs={"facility_external_id": facility_id},
+        )
+        data = {
+            "account": account_id,
+            "target_invoice": target_invoice,
+            "reconciliation_type": "payment",
+            "status": "active",
+            "kind": "deposit",
+            "issuer_type": "patient",
+            "outcome": "complete",
+            "method": "cash",
+            "tendered_amount": amount,
+            "returned_amount": "0.00",
+            "amount": amount,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    # ------------------------------------------------------------------
+    # Tokens / Questionnaire responses / Consent
+    # ------------------------------------------------------------------
+    def create_token(self, facility_id, queue_id, patient_id, category_id, **kwargs):
+        url = reverse(
+            "queue-list",
+            kwargs={
+                "facility_external_id": facility_id,
+                "token_queue_external_id": queue_id,
+            },
+        )
+        data = {
+            "patient": patient_id,
+            "category": category_id,
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def submit_questionnaire_response(
+        self, slug, patient_id, encounter_id, results=None, **kwargs
+    ):
+        url = reverse("questionnaire-submit", kwargs={"slug": slug})
+        data = {
+            "resource_id": encounter_id or patient_id,
+            "patient": patient_id,
+            "encounter": encounter_id,
+            "results": results or [],
+            **kwargs,
+        }
+        return self.post(url, data)
+
+    def create_consent(self, patient_id, encounter_id, **kwargs):
+        url = reverse("consent-list", kwargs={"patient_external_id": patient_id})
+        now = timezone.now()
+        data = {
+            "status": "active",
+            "category": "treatment",
+            "encounter": encounter_id,
+            "decision": "permit",
+            "date": now.isoformat(),
+            "period": {
+                "start": now.isoformat(),
+                "end": (now + timedelta(days=30)).isoformat(),
+            },
+            "note": "Patient consents to treatment.",
             **kwargs,
         }
         return self.post(url, data)

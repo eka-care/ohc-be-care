@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+from django.db import transaction
 from django.utils import timezone
 
 from care.emr.resources.encounter.constants import StatusChoices
@@ -131,13 +132,15 @@ def load_fixtures(base):  # noqa: PLR0915, PLR0912
         patients.append(base.create_patient(geo_organization.id))
     log("Loading patients completed")
 
+    patient_encounters = []
     for patient in patients:
-        base.create_encounter(
+        encounter = base.create_encounter(
             patient.id,
             facility_id,
             organizations=[general_medicine.id],
             status=StatusChoices.in_progress.value,
         )
+        patient_encounters.append((patient, encounter))
     log("Loading encounters completed")
 
     admin_org = departments.get("Administration")
@@ -173,6 +176,15 @@ def load_fixtures(base):  # noqa: PLR0915, PLR0912
 
     load_scheduling(base, facility_id, created_users, patients, departments, roles)
     log("Loading scheduling completed")
+
+    load_clinical_data(
+        base,
+        facility_id,
+        patient_encounters,
+        created_users.get("Doctor"),
+        ward,
+    )
+    log("Loading clinical, lab, billing and token data completed")
 
     setup_managing_organization(base, role_orgs, geo_organization.id, password)
     log("Loading managing organization completed")
@@ -446,6 +458,194 @@ def load_scheduling(base, facility_id, created_users, patients, departments, rol
                 slot_id=slots[idx].id,
                 patient_id=patient.id,
                 note=f"Auto-booked fixture appointment {idx + 1}",
+            )
+
+
+def _snomed(code, display):
+    return {"system": "http://snomed.info/sct", "code": code, "display": display}
+
+
+def load_clinical_data(base, facility_id, patient_encounters, doctor, ward):
+    """Populate clinical chart, lab, billing and token data for demo patients.
+
+    Each sub-step is wrapped in a savepoint so a single failure (e.g. inventory
+    running low) is logged and skipped without aborting the whole fixture load.
+    """
+    from care.emr.models import InventoryItem, TokenCategory, TokenQueue
+
+    def safe(label, fn):
+        try:
+            with transaction.atomic():
+                return fn()
+        except Exception as e:
+            log(f"  [skip] {label}: {type(e).__name__}: {str(e)[:160]}")
+            return None
+
+    symptoms = [
+        _snomed("386661006", "Fever"),
+        _snomed("25064002", "Headache"),
+        _snomed("422587007", "Nausea"),
+        _snomed("267036007", "Dyspnea"),
+        _snomed("49727002", "Cough"),
+    ]
+    diagnoses = [
+        _snomed("44054006", "Type 2 Diabetes Mellitus"),
+        _snomed("38341003", "Hypertension"),
+        _snomed("195967001", "Asthma"),
+        _snomed("13645005", "COPD"),
+        _snomed("709044004", "Chronic Kidney Disease"),
+    ]
+    allergies = [
+        _snomed("373270004", "Penicillin"),
+        _snomed("91935009", "Peanut"),
+        _snomed("425525006", "Dairy product"),
+        _snomed("293586001", "Aspirin"),
+    ]
+    medications = [
+        _snomed("387207008", "Ibuprofen"),
+        _snomed("387517004", "Paracetamol"),
+        _snomed("372687004", "Amoxicillin"),
+        _snomed("372567009", "Metformin"),
+    ]
+    lab_tests = [
+        _snomed("26604007", "Complete blood count"),
+        _snomed("33747003", "Glucose measurement"),
+        _snomed("166312007", "Blood chemistry"),
+    ]
+    lab_category = {
+        "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+        "code": "LAB",
+        "display": "Laboratory",
+    }
+    doctor_id = doctor.id if doctor else None
+    ward_id = ward.id if ward else None
+
+    # --- Clinical chart for every patient -------------------------------
+    for idx, (patient, encounter) in enumerate(patient_encounters):
+        pid, eid = patient.id, encounter.id
+        safe(
+            "symptom",
+            lambda p=pid, e=eid, i=idx: base.create_symptom(
+                p, e, symptoms[i % len(symptoms)]
+            ),
+        )
+        safe(
+            "diagnosis",
+            lambda p=pid, e=eid, i=idx: base.create_diagnosis(
+                p, e, diagnoses[i % len(diagnoses)]
+            ),
+        )
+        safe(
+            "allergy",
+            lambda p=pid, e=eid, i=idx: base.create_allergy_intolerance(
+                p, e, allergies[i % len(allergies)]
+            ),
+        )
+        safe(
+            "medication_request",
+            lambda p=pid, e=eid, i=idx: base.create_medication_request(
+                p, e, medications[i % len(medications)]
+            ),
+        )
+        if doctor_id:
+            safe(
+                "prescription",
+                lambda p=pid, e=eid: base.create_medication_request_prescription(
+                    p, e, doctor_id
+                ),
+            )
+        safe("consent", lambda p=pid, e=eid: base.create_consent(p, e))
+
+    # --- Lab orders + results for the first half of patients ------------
+    for idx, (patient, encounter) in enumerate(patient_encounters[:5]):
+        code = lab_tests[idx % len(lab_tests)]
+
+        def lab_chain(p=patient, e=encounter, c=code):
+            sr = base.create_service_request(
+                facility_id, e.id, doctor_id, c, [ward_id] if ward_id else []
+            )
+            base.create_specimen(
+                facility_id, sr.id, _snomed("122555007", "Venous blood specimen")
+            )
+            report = base.create_diagnostic_report(p.id, sr.id, lab_category)
+            base.add_observations_to_report(
+                p.id,
+                report.id,
+                [
+                    {
+                        "observation": {
+                            "status": "final",
+                            "value_type": "quantity",
+                            "main_code": c,
+                            "effective_datetime": timezone.now().isoformat(),
+                            "value": {
+                                "value": "95",
+                                "unit": {
+                                    "system": "http://unitsofmeasure.org",
+                                    "code": "mg/dL",
+                                    "display": "mg/dL",
+                                },
+                            },
+                        },
+                        "observation_definition": None,
+                        "observation_id": None,
+                    }
+                ],
+            )
+
+        safe("lab_chain", lab_chain)
+
+    # --- Medication dispense (auto-creates Account + ChargeItem) --------
+    inventory_item = (
+        InventoryItem.objects.select_related("location")
+        .filter(location__facility__external_id=facility_id, net_content__gte=5)
+        .order_by("-net_content")
+        .first()
+    )
+    if inventory_item and inventory_item.location:
+        loc_id = str(inventory_item.location.external_id)
+        item_id = str(inventory_item.external_id)
+        for _patient, encounter in patient_encounters[5:8]:
+            safe(
+                "medication_dispense",
+                lambda e=encounter: base.create_medication_dispense(
+                    e.id, loc_id, item_id, quantity=1
+                ),
+            )
+
+    # --- Explicit billing chain for patients without a dispense ---------
+    unit_price_components = [
+        {
+            "monetary_component_type": "base",
+            "currency": "INR",
+            "amount": "500.00",
+            "code": _snomed("consult-001", "Consultation"),
+        }
+    ]
+    for patient, encounter in patient_encounters[8:10]:
+
+        def billing_chain(p=patient, e=encounter):
+            account = base.create_account(facility_id, p.id)
+            charge_item = base.create_charge_item(
+                facility_id, e.id, account.id, unit_price_components
+            )
+            invoice = base.create_invoice(facility_id, account.id, [charge_item.id])
+            base.create_payment_reconciliation(
+                facility_id, account.id, invoice.id, "500.00"
+            )
+
+        safe("billing_chain", billing_chain)
+
+    # --- Tokens for the first few patients ------------------------------
+    queue = TokenQueue.objects.first()
+    category = TokenCategory.objects.first()
+    if queue and category:
+        q_id = str(queue.external_id)
+        c_id = str(category.external_id)
+        for patient, _encounter in patient_encounters[:3]:
+            safe(
+                "token",
+                lambda p=patient: base.create_token(facility_id, q_id, p.id, c_id),
             )
 
 
