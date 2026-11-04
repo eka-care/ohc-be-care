@@ -4,7 +4,7 @@ from plugs.plug import Plug
 care_scribe = Plug(
     name="care_scribe",
     package_name="git+https://github.com/eka-care/care_scribe.git",
-    version="@4bb03093360032c0a8429d142a6578ada303f8cb",
+    version="@7aec19db4320f49e2fe5f4ce98ef2de9d5666f6d",
 )
 
 plugs = [care_scribe]
