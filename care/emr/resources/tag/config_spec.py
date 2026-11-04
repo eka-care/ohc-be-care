@@ -43,6 +43,7 @@ class TagResource(str, Enum):
     supply_request_order = "supply_request_order"
     supply_delivery_order = "supply_delivery_order"
     account = "account"
+    location = "location"
 
 
 class TagStatus(str, Enum):
@@ -76,12 +77,16 @@ class TagConfigUpdateSpec(TagConfigBaseSpec):
             obj.organization = get_object_or_404(
                 Organization.objects.only("id"), external_id=self.organization
             )
+        else:
+            obj.organization = None
         if self.facility_organization:
             obj.facility_organization = get_object_or_404(
                 FacilityOrganization.objects.only("id"),
                 external_id=self.facility_organization,
                 facility=obj.facility,
             )
+        else:
+            obj.facility_organization = None
 
 
 class TagConfigWriteSpec(TagConfigBaseSpec):

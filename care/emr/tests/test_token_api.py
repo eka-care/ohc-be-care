@@ -361,6 +361,63 @@ class TokenAPITests(CareAPITestBase):
             response.data["detail"],
         )
 
+    def test_update_token_with_invalid_queue_without_url_resource_permission(self):
+        """Test wrong-queue updates deny before exposing queue mismatch."""
+        self.client.force_authenticate(user=self.user)
+        actual_resource_user = self.create_user()
+        self.attach_role_facility_organization_user(
+            user=actual_resource_user,
+            role=self.role,
+            facility_organization=self.facility_organization,
+        )
+        self.attach_role_facility_organization_user(
+            user=self.user,
+            role=self.role,
+            facility_organization=self.facility_organization,
+        )
+        actual_resource = self.create_schedule_resource(
+            facility=self.facility,
+            user=actual_resource_user,
+        )
+        actual_queue = self.create_queue(
+            facility=self.facility,
+            resource=actual_resource,
+            date=timezone.now().date(),
+        )
+        token = self.create_token(
+            patient=self.patient,
+            category=self.token_category,
+            queue=actual_queue,
+            facility=self.facility,
+        )
+        url_resource = self.create_schedule_resource(
+            facility=self.facility,
+            user=self.create_user(),
+        )
+        url_queue = self.create_queue(
+            facility=self.facility,
+            resource=url_resource,
+            date=timezone.now().date(),
+        )
+        token_data = {
+            "status": TokenStatusOptions.IN_PROGRESS,
+            "note": "Token is in progress",
+            "sub_queue": None,
+        }
+        response = self.client.put(
+            self.generate_detail_url(
+                str(self.facility.external_id),
+                str(url_queue.external_id),
+                str(token.external_id),
+            ),
+            data=token_data,
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            response.data["detail"], "You do not have permission to update token"
+        )
+
     def test_update_token_with_different_facility_for_subqueue_and_queue(self):
         """Test updating a token with different facility for subqueue and queue."""
         self.client.force_authenticate(user=self.superuser)
@@ -627,6 +684,34 @@ class TokenAPITests(CareAPITestBase):
         self.assertEqual(response.status_code, 403)
         self.assertIn(
             "You do not have permission to read token", response.data["detail"]
+        )
+
+    def test_retrieve_token_with_invalid_queue_external_id(self):
+        """Test retrieving a token with invalid queue external id."""
+        self.client.force_authenticate(user=self.superuser)
+        token = self.create_token(
+            patient=self.patient,
+            category=self.token_category,
+            queue=self.token_queue,
+            facility=self.facility,
+            status=TokenStatusOptions.CREATED,
+        )
+        another_token_queue = self.create_queue(
+            facility=self.facility,
+            resource=self.schedule_resource,
+            date=timezone.now().date(),
+        )
+        response = self.client.get(
+            self.generate_detail_url(
+                str(self.facility.external_id),
+                str(another_token_queue.external_id),
+                str(token.external_id),
+            )
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data["errors"][0]["msg"],
+            "Token does not belong to the specified queue",
         )
 
     # Tests for Token Listing
@@ -968,6 +1053,36 @@ class TokenAPITests(CareAPITestBase):
         self.assertEqual(response.status_code, 204)
         token.refresh_from_db()
         self.assertEqual(token.status, TokenStatusOptions.ENTERED_IN_ERROR)
+
+    def test_deleted_token_number_is_not_reused(self):
+        """A token created after a delete must not get an existing number."""
+        self.client.force_authenticate(user=self.superuser)
+        token_data = self.generate_token_data(
+            patient=self.patient.external_id,
+            category=self.token_category.external_id,
+        )
+        first = self.client.post(self.token_url, data=token_data, format="json")
+        second = self.client.post(self.token_url, data=token_data, format="json")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+
+        response = self.client.delete(
+            self.generate_detail_url(
+                str(self.facility.external_id),
+                str(self.token_queue.external_id),
+                first.data["id"],
+            )
+        )
+        self.assertEqual(response.status_code, 204)
+
+        third = self.client.post(self.token_url, data=token_data, format="json")
+        self.assertEqual(third.status_code, 200)
+        numbers = list(
+            Token.objects.filter(
+                queue=self.token_queue, category=self.token_category
+            ).values_list("number", flat=True)
+        )
+        self.assertEqual(sorted(numbers), [2, 3])
 
     def test_delete_token_as_user_with_permission(self):
         """Test deleting a token as a user with permission."""

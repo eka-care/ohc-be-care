@@ -7,6 +7,7 @@ from care.emr.models import Encounter, FacilityLocationEncounter
 from care.emr.models.location import FacilityLocation
 from care.emr.resources.base import EMRResource
 from care.emr.resources.common import Coding
+from care.emr.tagging.base import SingleFacilityTagManager
 
 
 class LocationEncounterAvailabilityStatusChoices(str, Enum):
@@ -39,6 +40,14 @@ class FacilityLocationOperationalStatusChoices(str, Enum):
 class FacilityLocationModeChoices(str, Enum):
     instance = "instance"
     kind = "kind"
+
+
+class InventoryUsage(str, Enum):
+    store = "store"
+    supplier = "supplier"
+    consumption = "consumption"
+    adjustment = "adjustment"
+    none = "none"
 
 
 class FacilityLocationFormChoices(str, Enum):
@@ -83,11 +92,17 @@ class FacilityLocationSpec(FacilityLocationBaseSpec):
     description: str
     location_type: Coding | None = None
     form: FacilityLocationFormChoices
+    inventory_usage: InventoryUsage = InventoryUsage.none
     sort_index: int | None = Field(
         default=0,
         ge=MIN_SORT_INDEX,
         le=MAX_SORT_INDEX,
     )
+
+    def perform_extra_deserialization(self, is_update, obj):
+        # The base deserializer skips defaults, including an explicit reset to none.
+        if "inventory_usage" in self.model_fields_set:
+            obj.inventory_usage = self.inventory_usage.value
 
 
 class FacilityLocationUpdateSpec(FacilityLocationSpec):
@@ -111,6 +126,7 @@ class FacilityLocationWriteSpec(FacilityLocationSpec):
         return self
 
     def perform_extra_deserialization(self, is_update, obj):
+        super().perform_extra_deserialization(is_update, obj)
         if self.parent:
             obj.parent = FacilityLocation.objects.get(external_id=self.parent)
         else:
@@ -135,13 +151,15 @@ class FacilityLocationListSpec(FacilityLocationMinimalListSpec):
     has_children: bool
     system_availability_status: str
     current_encounter: dict | None = None
+    tags: list[dict] = []
 
     @classmethod
     def perform_extra_serialization(cls, mapping, obj):
         from care.emr.resources.encounter.spec import EncounterListSpec
 
         super().perform_extra_serialization(mapping, obj)
-
+        if obj.tags:
+            mapping["tags"] = SingleFacilityTagManager().render_tags(obj)
         if obj.current_encounter:
             mapping["current_encounter"] = EncounterListSpec.serialize(
                 obj.current_encounter

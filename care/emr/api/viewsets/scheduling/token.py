@@ -73,10 +73,7 @@ class TokenViewSet(EMRModelViewSet):
         if instance.sub_queue and instance.sub_queue.resource != queue.resource:
             raise ValidationError("Sub Queue and Queue are not in the same resource")
         with Lock(f"booking:token:{queue.id}"), transaction.atomic():
-            instance.number = (
-                Token.objects.filter(queue=queue, category=instance.category).count()
-                + 1
-            )
+            instance.number = Token.get_next_number(queue, instance.category)
             instance.status = TokenStatusOptions.CREATED.value
             super().perform_create(instance)
 
@@ -133,13 +130,17 @@ class TokenViewSet(EMRModelViewSet):
             raise PermissionDenied("You do not have permission to create token")
 
     def authorize_update(self, request_obj, model_instance):
-        resource = model_instance.queue.resource
+        _, queue = self.get_queue_obj()
+        resource = queue.resource
         if not AuthorizationController.call(
             "can_write_token",
             resource,
             self.request.user,
         ):
             raise PermissionDenied("You do not have permission to update token")
+
+        if queue != model_instance.queue:
+            raise ValidationError("Token does not belong to the specified queue")
 
     def authorize_destroy(self, instance):
         self.authorize_update({}, instance)
@@ -153,9 +154,10 @@ class TokenViewSet(EMRModelViewSet):
             self.request.user,
         ):
             raise PermissionDenied("You do not have permission to read token")
+        if queue != model_instance.queue:
+            raise ValidationError("Token does not belong to the specified queue")
 
     def get_queryset(self):
-        _, queue = self.get_queue_obj()
         queryset = (
             super()
             .get_queryset()
@@ -163,6 +165,7 @@ class TokenViewSet(EMRModelViewSet):
             .order_by("-modified_date")
         )
         if self.action == "list":
+            _, queue = self.get_queue_obj()
             if not AuthorizationController.call(
                 "can_list_token",
                 queue.resource,

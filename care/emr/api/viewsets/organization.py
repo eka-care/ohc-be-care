@@ -28,6 +28,7 @@ from care.emr.resources.organization.spec import (
 from care.emr.resources.role.spec import RoleReadSpec
 from care.security.authorization import AuthorizationController
 from care.security.models import PermissionModel, RoleModel, RolePermission
+from care.security.permissions.organization import OrganizationPermissions
 from care.utils.filters.default_filter import DefaultBooleanFilter
 from care.utils.pagination.care_pagination import CareLimitOffsetPagination
 from care.utils.shortcuts import get_object_or_404
@@ -264,6 +265,19 @@ class OrganizationViewSet(EMRModelViewSet):
         my_organizations = OrganizationUser.objects.filter(
             organization__org_type=OrganizationTypeChoices.role.value, user=request.user
         ).only("organization_id", "role_id")
+
+        roles = RolePermission.objects.filter(
+            permission__slug__in=[
+                OrganizationPermissions.can_manage_connected_role_organizations.name
+            ]
+        ).values_list("role_id", flat=True)
+
+        managing_organizations = OrganizationUser.objects.filter(
+            organization__org_type=OrganizationTypeChoices.role.value,
+            user=request.user,
+            role_id__in=roles,
+        ).values_list("organization_id", flat=True)
+
         org_role_mapping = {}
         for my_organization in my_organizations:
             org_role_mapping[my_organization.organization_id] = my_organization.role_id
@@ -275,7 +289,7 @@ class OrganizationViewSet(EMRModelViewSet):
             )
         else:
             managing_organization = Organization.objects.filter(
-                Q(managing_organizations__overlap=list(my_organizations_ids))
+                Q(managing_organizations__overlap=list(managing_organizations))
                 | Q(id__in=my_organizations_ids)
             )
 
@@ -406,6 +420,9 @@ class OrganizationUsersViewSet(EMRModelViewSet):
         ):
             raise PermissionDenied("User does not have permission for this action")
 
+        if model_instance.organization != organization:
+            raise ValidationError("User does not belong to the organization")
+
     def authorize_destroy(self, instance):
         organization = self.get_organization_obj()
         if not AuthorizationController.call(
@@ -415,6 +432,9 @@ class OrganizationUsersViewSet(EMRModelViewSet):
             instance.role,
         ):
             raise PermissionDenied("User does not have permission for this action")
+
+        if instance.organization != organization:
+            raise ValidationError("User does not belong to the organization")
 
     def authorize_create(self, instance):
         """
@@ -435,15 +455,34 @@ class OrganizationUsersViewSet(EMRModelViewSet):
         ):
             raise PermissionDenied("User does not have permission for this action")
 
-    def get_queryset(self):
-        """
-        Only users part of the organization can access its users
-        """
+    def authorize_retrieve(self, model_instance):
         organization = self.get_organization_obj()
         if not AuthorizationController.call(
             "can_list_organization_users_obj", self.request.user, organization
         ):
             raise PermissionDenied(
-                "User does not have the required permissions to list users"
+                "User does not have the required permission to read user"
             )
-        return OrganizationUser.objects.filter(organization=organization)
+        if model_instance.organization != organization:
+            raise ValidationError("User does not belong to the organization")
+
+    def get_queryset(self):
+        """
+        Only users part of the organization can access its users
+        """
+        queryset = (
+            super()
+            .get_queryset()
+            .select_related("created_by", "updated_by", "user", "role")
+            .order_by("-modified_date")
+        )
+        if self.action == "list":
+            organization = self.get_organization_obj()
+            if not AuthorizationController.call(
+                "can_list_organization_users_obj", self.request.user, organization
+            ):
+                raise PermissionDenied(
+                    "User does not have the required permission to list users"
+                )
+            return queryset.filter(organization=organization)
+        return queryset

@@ -1,10 +1,12 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.urls import reverse
 from model_bakery import baker
 
 from care.emr.models.charge_item_definition import ChargeItemDefinition
 from care.emr.models.product_knowledge import ProductKnowledge
+from care.emr.models.supply_delivery import SupplyDelivery
 from care.emr.resources.inventory.inventory_item.sync_inventory_item import (
     sync_inventory_item,
 )
@@ -16,13 +18,22 @@ from care.emr.resources.inventory.supply_delivery.spec import (
     SupplyDeliveryStatusOptions,
     SupplyDeliveryTypeOptions,
 )
+from care.emr.signals.patient.facility_name_identifier import (
+    FacilityPatientNameIdentifierConfig,
+)
+from care.emr.signals.patient.name_identifier import NameIdentifierConfig
+from care.emr.signals.patient.phone_number_identifier import PhoneNumberIdentifierConfig
 from care.security.permissions.supply_delivery import SupplyDeliveryPermissions
+from care.utils.lock import ObjectLocked
 from care.utils.tests.base import CareAPITestBase
 
 
-class TestSupplyDeliveryViewSet(CareAPITestBase):
+class TestSupplyDeliveryViewSetBase(CareAPITestBase):
     def setUp(self):
         super().setUp()
+        NameIdentifierConfig.CACHED_CONFIG = {}
+        PhoneNumberIdentifierConfig.CACHED_CONFIG = {}
+        FacilityPatientNameIdentifierConfig.CACHED_CONFIG = {}
         self.user = self.create_user(username="testuser")
         self.superuser = self.create_super_user(username="superuser")
         self.patient = self.create_patient(name="Test Patient")
@@ -40,6 +51,13 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
             ChargeItemDefinition,
             facility=self.facility,
             slug=f"f-{self.facility.external_id}-charge-item-definition",
+            price_components=[
+                {
+                    "amount": str(Decimal(100)),
+                    "monetary_component_type": "base",
+                    "factor": None,
+                }
+            ],
         )
         self.product = self.create_product(facility=self.facility)
 
@@ -201,6 +219,8 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
 
     # Testcases for create supply delivery
 
+
+class TestSupplyDeliveryViewSet(TestSupplyDeliveryViewSetBase):
     def test_create_supply_delivery_internally_as_superuser(self):
         """
         Test creating a supply delivery internally as a superuser from origin to destination
@@ -213,6 +233,10 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
         )
         response = self.client.post(self.base_url, data, format="json")
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            Decimal(response.data["supplied_inventory_item"]["net_content"]),
+            Decimal(450),
+        )
         get_response = self.client.get(self.get_detail_url(response.data["id"]))
         self.assertEqual(get_response.status_code, 200)
         self.assertEqual(get_response.data["supplied_item_quantity"], "50.000000")
@@ -269,6 +293,10 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
             format="json",
         )
         self.assertEqual(update_response.status_code, 200)
+        self.assertEqual(
+            Decimal(update_response.data["supplied_inventory_item"]["net_content"]),
+            Decimal(2000),
+        )
         self.inventory_item_destination.refresh_from_db()
         self.assertEqual(self.inventory_item_destination.net_content, Decimal(2000))
 
@@ -316,10 +344,16 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
         Test creating a external supply delivery as a user with permissions
         """
         self.client.force_authenticate(user=self.user)
+        role = self.create_role_with_permissions(
+            permissions=[
+                SupplyDeliveryPermissions.can_read_supply_delivery.name,
+                SupplyDeliveryPermissions.can_write_external_supply_delivery.name,
+            ]
+        )
         self.attach_role_facility_organization_user(
             facility_organization=self.facility_organization,
             user=self.user,
-            role=self.role,
+            role=role,
         )
         data = self.create_supply_delivery_data(
             supplied_item=self.product.external_id,
@@ -356,6 +390,16 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
         Test creating a external supply delivery as a user without permissions
         """
         self.client.force_authenticate(user=self.user)
+        role = self.create_role_with_permissions(
+            permissions=[
+                SupplyDeliveryPermissions.can_read_supply_delivery.name,
+            ]
+        )
+        self.attach_role_facility_organization_user(
+            facility_organization=self.facility_organization,
+            user=self.user,
+            role=role,
+        )
         data = self.create_supply_delivery_data(
             supplied_item=self.product.external_id,
             order=self.delivery_order_destination_external.external_id,
@@ -564,10 +608,16 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
         Test updating an external supply delivery as a user with permissions
         """
         self.client.force_authenticate(user=self.user)
+        role = self.create_role_with_permissions(
+            permissions=[
+                SupplyDeliveryPermissions.can_read_supply_delivery.name,
+                SupplyDeliveryPermissions.can_write_external_supply_delivery.name,
+            ]
+        )
         self.attach_role_facility_organization_user(
             facility_organization=self.facility_organization,
             user=self.user,
-            role=self.role,
+            role=role,
         )
         supply_delivery = self.create_supply_delivery(
             order=self.delivery_order_destination_external,
@@ -626,6 +676,16 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
         Test updating an external supply delivery as a user without permissions
         """
         self.client.force_authenticate(user=self.user)
+        role = self.create_role_with_permissions(
+            permissions=[
+                SupplyDeliveryPermissions.can_read_supply_delivery.name,
+            ]
+        )
+        self.attach_role_facility_organization_user(
+            facility_organization=self.facility_organization,
+            user=self.user,
+            role=role,
+        )
         supply_delivery = self.create_supply_delivery(
             order=self.delivery_order_destination_external,
             supplied_item_quantity=Decimal(500),
@@ -745,6 +805,76 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
             "Supply delivery is abandoned or entered in error",
             status_code=400,
         )
+
+    def test_update_supply_delivery_rejects_cancelled_parent_order(self):
+        self.client.force_authenticate(user=self.superuser)
+        supply_delivery = self.create_supply_delivery(
+            order=self.delivery_order_internal,
+            supplied_item_quantity=Decimal(50),
+            supplied_item=self.product,
+            status=SupplyDeliveryStatusOptions.in_progress.value,
+            supplied_inventory_item=self.inventory_item_origin,
+        )
+        for status in (
+            SupplyDeliveryOrderStatusOptions.abandoned.value,
+            SupplyDeliveryOrderStatusOptions.entered_in_error.value,
+        ):
+            with self.subTest(status=status):
+                self.delivery_order_internal.status = status
+                self.delivery_order_internal.save(update_fields=["status"])
+
+                response = self.client.put(
+                    self.get_detail_url(supply_delivery.external_id),
+                    {"status": SupplyDeliveryStatusOptions.completed.value},
+                    format="json",
+                )
+
+                self.assertContains(
+                    response,
+                    "Delivery order is abandoned or entered in error",
+                    status_code=400,
+                )
+                supply_delivery.refresh_from_db()
+                self.assertEqual(
+                    supply_delivery.status,
+                    SupplyDeliveryStatusOptions.in_progress.value,
+                )
+                self.inventory_item_origin.refresh_from_db()
+                self.inventory_item_destination.refresh_from_db()
+                self.assertEqual(self.inventory_item_origin.net_content, Decimal(450))
+                self.assertEqual(
+                    self.inventory_item_destination.net_content, Decimal(1500)
+                )
+
+    def test_update_supply_delivery_with_completed_parent_order(self):
+        self.client.force_authenticate(user=self.superuser)
+        supply_delivery = self.create_supply_delivery(
+            order=self.delivery_order_internal,
+            supplied_item_quantity=Decimal(50),
+            supplied_item=self.product,
+            status=SupplyDeliveryStatusOptions.in_progress.value,
+            supplied_inventory_item=self.inventory_item_origin,
+        )
+        self.delivery_order_internal.status = (
+            SupplyDeliveryOrderStatusOptions.completed.value
+        )
+        self.delivery_order_internal.save(update_fields=["status"])
+
+        response = self.client.put(
+            self.get_detail_url(supply_delivery.external_id),
+            {"status": SupplyDeliveryStatusOptions.completed.value},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        supply_delivery.refresh_from_db()
+        self.assertEqual(
+            supply_delivery.status, SupplyDeliveryStatusOptions.completed.value
+        )
+        self.inventory_item_origin.refresh_from_db()
+        self.inventory_item_destination.refresh_from_db()
+        self.assertEqual(self.inventory_item_origin.net_content, Decimal(450))
+        self.assertEqual(self.inventory_item_destination.net_content, Decimal(1550))
 
     def test_update_supply_delivery_with_status_abandoned(self):
         """
@@ -1879,3 +2009,145 @@ class TestSupplyDeliveryViewSet(CareAPITestBase):
             response.data["results"][0]["supplied_item"]["id"],
             str(self.product.external_id),
         )
+
+    def internal_deliveries(self):
+        return SupplyDelivery.objects.filter(order=self.delivery_order_internal)
+
+    def test_upsert_same_supply_delivery_item_uses_current_stock(self):
+        self.client.force_authenticate(user=self.superuser)
+        upsert_url = reverse("supply_delivery-upsert")
+        data = self.create_supply_delivery_data(
+            supplied_inventory_item=str(self.inventory_item_origin.external_id),
+            order=str(self.delivery_order_internal.external_id),
+            quantity=Decimal(50),
+        )
+        deliveries = SupplyDelivery.objects.filter(order=self.delivery_order_internal)
+        inventory_model = type(self.inventory_item_origin)
+        initial_inventory_count = inventory_model.objects.count()
+
+        for batch_number in range(1, 3):
+            response = self.client.post(
+                upsert_url,
+                {"datapoints": [dict(data), dict(data)]},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 200, response.data)
+            self.assertEqual(len(response.data), 2)
+            self.inventory_item_origin.refresh_from_db()
+            self.inventory_item_destination.refresh_from_db()
+            self.assertEqual(deliveries.count(), batch_number * 2)
+            self.assertEqual(
+                self.inventory_item_origin.net_content,
+                Decimal(500 - batch_number * 100),
+            )
+            self.assertEqual(self.inventory_item_destination.net_content, Decimal(1500))
+            self.assertEqual(inventory_model.objects.count(), initial_inventory_count)
+
+    def test_upsert_same_supply_delivery_item_rejects_combined_insufficient_stock(self):
+        self.client.force_authenticate(user=self.superuser)
+        data = self.create_supply_delivery_data(
+            supplied_inventory_item=str(self.inventory_item_origin.external_id),
+            order=str(self.delivery_order_internal.external_id),
+            quantity=Decimal(300),
+        )
+        initial_delivery_count = SupplyDelivery.objects.count()
+        response = self.client.post(
+            reverse("supply_delivery-upsert"),
+            {"datapoints": [dict(data), dict(data)]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(len(response.data), 2)
+        self.assertIn(
+            "Insufficient stock",
+            str(response.data[1]),
+        )
+        self.assertEqual(
+            response.data[0].get("supplied_inventory_item").get("id"),
+            str(self.inventory_item_origin.external_id),
+        )
+        self.assertEqual(SupplyDelivery.objects.count(), initial_delivery_count)
+        self.inventory_item_origin.refresh_from_db()
+        self.inventory_item_destination.refresh_from_db()
+        self.assertEqual(self.inventory_item_origin.net_content, Decimal(500))
+        self.assertEqual(self.inventory_item_destination.net_content, Decimal(1500))
+
+        retry = self.client.post(
+            self.base_url,
+            {**data, "supplied_item_quantity": 100},
+            format="json",
+        )
+        self.assertEqual(retry.status_code, 200, retry.data)
+        self.inventory_item_origin.refresh_from_db()
+        self.assertEqual(self.inventory_item_origin.net_content, Decimal(400))
+
+    def test_upsert_later_invalid_item_allows_immediate_retry(self):
+        self.client.force_authenticate(user=self.superuser)
+        data = self.create_supply_delivery_data(
+            supplied_inventory_item=str(self.inventory_item_origin.external_id),
+            order=str(self.delivery_order_internal.external_id),
+            quantity=Decimal(100),
+        )
+        invalid = {
+            **data,
+            "supplied_inventory_item": str(self.inventory_item_destination.external_id),
+        }
+        response = self.client.post(
+            reverse("supply_delivery-upsert"),
+            {"datapoints": [dict(data), invalid]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(self.internal_deliveries().count(), 0)
+        self.inventory_item_origin.refresh_from_db()
+        self.assertEqual(self.inventory_item_origin.net_content, Decimal(500))
+
+        retry = self.client.post(self.base_url, data, format="json")
+        self.assertEqual(retry.status_code, 200, retry.data)
+        self.inventory_item_origin.refresh_from_db()
+        self.assertEqual(self.inventory_item_origin.net_content, Decimal(400))
+
+    def test_lock_is_released_once_the_request_transaction_commits(self):
+        self.client.force_authenticate(user=self.superuser)
+        data = self.create_supply_delivery_data(
+            supplied_inventory_item=str(self.inventory_item_origin.external_id),
+            order=str(self.delivery_order_internal.external_id),
+            quantity=Decimal(100),
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            first = self.client.post(self.base_url, dict(data), format="json")
+        self.assertEqual(first.status_code, 200, first.data)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            second = self.client.post(self.base_url, dict(data), format="json")
+        self.assertEqual(second.status_code, 200, second.data)
+
+        self.assertEqual(self.internal_deliveries().count(), 2)
+        self.inventory_item_origin.refresh_from_db()
+        self.inventory_item_destination.refresh_from_db()
+        self.assertEqual(self.inventory_item_origin.net_content, Decimal(300))
+        self.assertEqual(self.inventory_item_destination.net_content, Decimal(1500))
+
+    def test_create_rejects_locked_inventory_item(self):
+        self.client.force_authenticate(user=self.superuser)
+        data = self.create_supply_delivery_data(
+            supplied_inventory_item=str(self.inventory_item_origin.external_id),
+            order=str(self.delivery_order_internal.external_id),
+            quantity=Decimal(100),
+        )
+        with patch(
+            "care.emr.api.viewsets.inventory.supply_delivery.lock_inventory_items",
+            side_effect=ObjectLocked,
+        ):
+            response = self.client.post(self.base_url, data, format="json")
+        self.assertContains(
+            response,
+            "Supply delivery creation failed . try again after a while",
+            status_code=400,
+        )
+        self.assertEqual(self.internal_deliveries().count(), 0)
+        self.inventory_item_origin.refresh_from_db()
+        self.inventory_item_destination.refresh_from_db()
+        self.assertEqual(self.inventory_item_origin.net_content, Decimal(500))
+        self.assertEqual(self.inventory_item_destination.net_content, Decimal(1500))

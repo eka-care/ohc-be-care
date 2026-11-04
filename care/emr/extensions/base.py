@@ -15,6 +15,8 @@ class ExtensionResource(str, Enum):
     supply_delivery = "supply_delivery"
     supply_delivery_order = "supply_delivery_order"
     product = "product"
+    resource_request = "resource_request"
+    facility = "facility"
 
 
 class ExtensionOwners(str, Enum):

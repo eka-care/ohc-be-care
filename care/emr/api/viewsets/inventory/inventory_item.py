@@ -1,6 +1,6 @@
 from django.db.models import Q
 from django_filters import rest_framework as filters
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import OrderingFilter
 
 from care.emr.api.viewsets.base import EMRBaseViewSet, EMRListMixin, EMRRetrieveMixin
@@ -20,6 +20,9 @@ class InventoryItemFilters(filters.FilterSet):
     product_knowledge = filters.UUIDFilter(
         field_name="product__product_knowledge__external_id"
     )
+    product_expiration_date = filters.DateTimeFromToRangeFilter(
+        field_name="product__expiration_date"
+    )
     status = filters.CharFilter(lookup_expr="iexact")
     net_content_gt = filters.NumberFilter(field_name="net_content", lookup_expr="gt")
     include_children = DummyBooleanFilter()
@@ -32,7 +35,12 @@ class InventoryItemViewSet(EMRRetrieveMixin, EMRListMixin, EMRBaseViewSet):
     pydantic_retrieve_model = InventoryItemRetrieveSpec
     filterset_class = InventoryItemFilters
     filter_backends = [filters.DjangoFilterBackend, OrderingFilter]
-    ordering_fields = ["created_date", "modified_date", "net_content"]
+    ordering_fields = [
+        "created_date",
+        "modified_date",
+        "net_content",
+        "product__expiration_date",
+    ]
 
     def get_location_obj(self):
         return get_object_or_404(
@@ -46,19 +54,27 @@ class InventoryItemViewSet(EMRRetrieveMixin, EMRListMixin, EMRBaseViewSet):
             raise PermissionDenied("You do not have permission to read inventory items")
 
     def authorize_retrieve(self, model_instance):
-        self.authorize_location_read(model_instance.location)
+        location = self.get_location_obj()
+        item_location = model_instance.location
+        self.authorize_location_read(location)
+        if location.id != item_location.id:
+            raise ValidationError(
+                "Inventory item does not belong to the specified location"
+            )
 
     def get_queryset(self):
         queryset = super().get_queryset()
         location = self.get_location_obj()
-        self.authorize_location_read(location)
-        include_children = (
-            self.request.GET.get("include_children", "false").lower() == "true"
-        )
-        if include_children:
-            queryset = queryset.filter(
-                Q(location__parent_cache__overlap=[location.id]) | Q(location=location)
+        if self.action == "list":
+            self.authorize_location_read(location)
+            include_children = (
+                self.request.GET.get("include_children", "false").lower() == "true"
             )
-        else:
-            queryset = queryset.filter(location=location)
+            if include_children:
+                queryset = queryset.filter(
+                    Q(location__parent_cache__overlap=[location.id])
+                    | Q(location=location)
+                )
+            else:
+                queryset = queryset.filter(location=location)
         return queryset

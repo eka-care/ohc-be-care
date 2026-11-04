@@ -126,7 +126,7 @@ class MedicationDispenseWriteSpec(BaseMedicationDispenseSpec):
     location: UUID4
     authorizing_request: UUID4 | None = None
     item: UUID4
-    quantity: Decimal = Field(max_digits=20, decimal_places=0)
+    quantity: Decimal = Field(max_digits=20, decimal_places=0, ge=1)
     days_supply: Decimal | None = Field(default=None, max_digits=20, decimal_places=0)
     fully_dispensed: bool | None = None
     order: UUID4 | None = None
@@ -199,6 +199,7 @@ class MedicationDispenseUpdateSpec(BaseMedicationDispenseSpec):
     order: UUID4 | None = None
 
     def perform_extra_deserialization(self, is_update, obj):
+        obj._original_order_id = obj.order_id  # noqa: SLF001
         obj._fully_dispensed = self.fully_dispensed  # noqa
         if self.order:
             obj.order = get_object_or_404(

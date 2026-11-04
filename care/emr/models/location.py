@@ -18,6 +18,7 @@ class FacilityLocation(EMRBaseModel):
     mode = models.CharField(max_length=255)
     location_type = models.JSONField(default=dict, null=True, blank=True)
     form = models.CharField(max_length=255)
+    inventory_usage = models.CharField(max_length=255, default="none")
     facility_organization_cache = ArrayField(models.IntegerField(), default=list)
     facility = models.ForeignKey("facility.Facility", on_delete=models.PROTECT)
     parent = models.ForeignKey(
@@ -35,7 +36,7 @@ class FacilityLocation(EMRBaseModel):
         Encounter, on_delete=models.SET_NULL, null=True, blank=True, default=None
     )  # Populated from FacilityLocationEncounter
     sort_index = models.IntegerField(default=0)
-
+    tags = ArrayField(models.IntegerField(), default=list)
     cache_expiry_days = 15
 
     def get_parent_json(self):
