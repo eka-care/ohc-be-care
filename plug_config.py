@@ -7,6 +7,12 @@ care_scribe = Plug(
     version="@9b32624b511216a928061f2c52793255547e7cee",
 )
 
-plugs = [care_scribe]
+abdm = Plug(
+    name="abdm",
+    package_name="git+https://github.com/ohcnetwork/care-abdm.git",
+    version="@969a27839c02baeee319de1c07f1f93ef145b959#subdirectory=backend",
+)
+
+plugs = [care_scribe, abdm]
 
 manager = PlugManager(plugs)
