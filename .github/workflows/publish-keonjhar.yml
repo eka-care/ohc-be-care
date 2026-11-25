@@ -1,0 +1,38 @@
+# Builds the image and pushes it to Keonjhar's ECR (Eka-care-sandbox-2, ap-south-1). No stored AWS keys: the job
+# assumes the role tofu made for this repository (InfraKode tofu/aws, output registry.push_role), which trusts
+# only branches and tags of eka-care/ohc-be-care, never a pull request. Set it once as the repository variable
+# KEONJHAR_ECR_PUSH_ROLE. Tags are immutable: sha-<commit> for develop, the tag name for a release tag.
+name: Publish image (Keonjhar ECR)
+on:
+  push:
+    branches: [develop]
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: publish-keonjhar-${{ github.ref }}
+jobs:
+  publish:
+    if: github.repository == 'eka-care/ohc-be-care'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.KEONJHAR_ECR_PUSH_ROLE }}
+          aws-region: ap-south-1
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/prod.Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          cache-from: type=gha,scope=keonjhar
+          cache-to: type=gha,mode=max,scope=keonjhar
+          tags: ${{ steps.ecr.outputs.registry }}/ohc-care-be:${{ github.ref_type == 'tag' && github.ref_name || format('sha-{0}', github.sha) }}
