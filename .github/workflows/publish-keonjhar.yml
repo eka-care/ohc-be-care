@@ -16,7 +16,9 @@ concurrency:
 jobs:
   publish:
     if: github.repository == 'eka-care/ohc-be-care'
-    runs-on: ubuntu-latest
+    # Eka-care's own ephemeral runners (eka-terraform-aws-github-runner, dev pool, staging 607765814920). This
+    # repository is public: only push and tag events run here, never a pull request.
+    runs-on: dev-linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
